@@ -66,3 +66,56 @@ def object_goal_distance(
     distance = torch.norm(des_pos_w - object.data.root_pos_w, dim=1)
     # rewarded if the object is lifted above the threshold
     return (object.data.root_pos_w[:, 2] > minimal_height) * (1 - torch.tanh(distance / std))
+
+def object_grasped(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+) -> torch.Tensor:
+    """Reward the agent for grasping the object.
+    
+    Grasp is detected when:
+    1. End-effector is close to the object
+    2. Gripper fingers are closing (joint position < threshold)
+    """
+    robot: RigidObject = env.scene[robot_cfg.name]
+    object: RigidObject = env.scene[object_cfg.name]
+    ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
+
+    # EE와 큐브 거리
+    cube_pos_w = object.data.root_pos_w
+    ee_w = ee_frame.data.target_pos_w[..., 0, :]
+    ee_dist = torch.norm(cube_pos_w - ee_w, dim=1)
+
+    # 그리퍼 손가락 joint positions (Franka: joint index 7, 8)
+    finger_pos = robot.data.joint_pos[:, 7:9]  # 두 손가락
+    gripper_closed = torch.mean(finger_pos, dim=1) < 0.035  # 0.04가 완전 열림
+
+    # EE가 가깝고 + 그리퍼가 닫히면 reward
+    is_close = ee_dist < 0.05
+    return (is_close & gripper_closed).float()
+
+def object_placed(
+    env: ManagerBasedRLEnv,
+    std: float,
+    command_name: str,
+    lift_height_threshold: float,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+) -> torch.Tensor:
+    """Reward for placing: only when lifted AND near goal XY position."""
+    robot: RigidObject = env.scene[robot_cfg.name]
+    object: RigidObject = env.scene[object_cfg.name]
+    command = env.command_manager.get_command(command_name)
+
+    des_pos_b = command[:, :3]
+    des_pos_w, _ = combine_frame_transforms(robot.data.root_pos_w, robot.data.root_quat_w, des_pos_b)
+
+    # XY 거리
+    xy_distance = torch.norm(des_pos_w[:, :2] - object.data.root_pos_w[:, :2], dim=1)
+
+    # 반드시 들려있을 때만 reward
+    is_lifted = object.data.root_pos_w[:, 2] > lift_height_threshold
+
+    return is_lifted.float() * (1 - torch.tanh(xy_distance / std))
